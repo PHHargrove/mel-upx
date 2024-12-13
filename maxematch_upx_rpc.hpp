@@ -363,11 +363,12 @@ class MaxEdgeMatchUPXRPC
             }
         }
 
-        // TODO: investigate other policies (as in testimm)
         void defer_rpc(enum rpc_op op, int target, GraphElem data_0, GraphElem data_1)
         {
-            const size_t limit = 100; // WAG + TODO: parameterize
+            const size_t hard_limit = 250; // WAG + TODO: parameterize
+            const size_t soft_limit = 100; // WAG + TODO: parameterize
 
+            // Append to the queue
             rpc_queue_.push( rpc_closure(op, target, data_0, data_1) );
 
             // Cannot continue immediate injection forever without polling GASNet
@@ -375,8 +376,24 @@ class MaxEdgeMatchUPXRPC
             // TRY_RPC(...,false)?
             upcxx::progress();
 
-            if (rpc_queue_.size() > limit)
+            // "hard" limit
+            // When the queue depth reaches this limit, upcxx:rpc() will be
+            // used to drain deferred RPCs until the depth falls to the soft
+            // limit.
+            if (rpc_queue_.size() >= hard_limit)
+            {
+                drain_deferred_rpc(soft_limit);
+                // will continue to service_deferred_rpc() below
+            }
+
+            // "soft" limit
+            // When the queue depth reaches this limit, upcxx:rpc_immediate()
+            // will be used to *attempt* to drain deferred RPCs, though in any
+            // given call there is no certainty any will be sent.
+            if (rpc_queue_.size() >= soft_limit)
+            {
                 service_deferred_rpc();
+            }
         }
 
         // initiate RPCs
