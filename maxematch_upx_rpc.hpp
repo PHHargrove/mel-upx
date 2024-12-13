@@ -13,6 +13,7 @@
 #include <utility>
 #include <cstring>
 #include <cassert>
+#include <queue>
 
 // TODO FIXME change comm_world to comm_
 
@@ -281,18 +282,159 @@ class MaxEdgeMatchUPXRPC
                 if (v_owner == rank_)
                     process_neighbors(v);
             }
+
+            drain_deferred_rpc();
         }
         
+        // Deferred RPCs
+        // TODO?: if "do_[OP]" were non-member functions, then could use
+        // function pointers instead of enum+switch
+
+        enum rpc_op {
+          REJECT,
+          REQUEST,
+          INVALID,
+        };
+
+        using rpc_closure = std::tuple<enum rpc_op, int, GraphElem, GraphElem>;
+
+        // for legible get<>
+        enum {
+            rpc_op,
+            rpc_target,
+            rpc_data_0,
+            rpc_data_1,
+        };
+
+        // send one deferred RPC
+        void deferred_rpc(rpc_closure& rpc, bool imm)
+        {
+                enum rpc_op op;
+                int target;
+                GraphElem data_0, data_1;
+                std::tie(op, target, data_0, data_1) = rpc;
+
+                switch (op) {
+                  case  REJECT: do_REJECT (target, data_0, data_1, imm); break;
+                  case REQUEST: do_REQUEST(target, data_0, data_1, imm); break;
+                  case INVALID: do_INVALID(target, data_0, data_1, imm); break;
+               }
+        }
+
+        // drain deferred RPCs until queue size is below 'limit' (default 0)
+        // TODO: "structure" the retries with sensitivity to which target(s)
+        // still see backpressure, as in service_deferred_rpc.
+        void drain_deferred_rpc(size_t limit = 0) {
+            while(rpc_queue_.size() > limit)
+            {
+                deferred_rpc( rpc_queue_.front(), false );
+                rpc_queue_.pop();
+            }
+        }
+
+        // try to issue deferred RPCs
+        // for any given target, will continue only until backpressure
+        void service_deferred_rpc(void) {
+            std::unordered_set<int> stalled;
+            std::queue<rpc_closure> tmp;
+            std::swap(tmp, rpc_queue_);
+            while(!tmp.empty())
+            {
+                auto rpc = tmp.front();
+                int target = std::get<rpc_target>(rpc);
+
+                if (stalled.count(target))
+                {
+                    rpc_queue_.push(rpc);
+                }
+                else
+                {
+                    try
+                    {
+                        deferred_rpc( rpc, true );
+                    }
+                    catch (upcxx::network_busy &e)
+                    {
+                        stalled.insert(target);
+                        rpc_queue_.push(rpc);
+                    }
+                }
+                tmp.pop();
+            }
+        }
+
+        void defer_rpc(enum rpc_op op, int target, GraphElem data_0, GraphElem data_1)
+        {
+            const size_t hard_limit = 250; // WAG + TODO: parameterize
+            const size_t soft_limit = 100; // WAG + TODO: parameterize
+
+            // Append to the queue
+            rpc_queue_.push( rpc_closure(op, target, data_0, data_1) );
+
+            // Cannot continue immediate injection forever without polling GASNet
+            // TODO: progress less often than every deferral, and/or relocate to
+            // TRY_RPC(...,false)?
+            upcxx::progress();
+
+            // "hard" limit
+            // When the queue depth reaches this limit, upcxx:rpc() will be
+            // used to drain deferred RPCs until the depth falls to the soft
+            // limit.
+            if (rpc_queue_.size() >= hard_limit)
+            {
+                drain_deferred_rpc(soft_limit);
+                // will continue to service_deferred_rpc() below
+            }
+
+            // "soft" limit
+            // When the queue depth reaches this limit, upcxx:rpc_immediate()
+            // will be used to *attempt* to drain deferred RPCs, though in any
+            // given call there is no certainty any will be sent.
+            if (rpc_queue_.size() >= soft_limit)
+            {
+                service_deferred_rpc();
+            }
+        }
+
         // initiate RPCs
+
+        // Select rpc vs rpc_immediate
+        // Is a macro because one cannot RPC a lambda passed as std::function<>
+        #define INJECT_RPC(imm, target, body) \
+            do \
+            { \
+                if (imm) \
+                { \
+                    current = upcxx::when_all(current, upcxx::rpc_immediate(target, body, dobj)); \
+                } \
+                else \
+                { \
+                    current = upcxx::when_all(current, upcxx::rpc(target, body, dobj)); \
+                } \
+            } while(0)
+
+        // Try to send RPC operation "op" via rpc_immediate
+        // On failure, enqueue for deferred retry
+        // Is a macro to enable token concatenation to match function and enum
+        // in the rpc_closure (used in lieu of storing a lambda as std::function<>).
+        #define TRY_RPC(target, op, data) \
+            do \
+            { \
+                try \
+                { \
+                    do_##op(target, data[0], data[1], true); \
+                } \
+                catch (upcxx::network_busy &e) \
+                { \
+                    defer_rpc(op, target, data[0], data[1]); \
+                } \
+            } while(0)
         
         // reject
-        void Push_REJECT(int target, GraphElem data[2])
+        void do_REJECT(int target, GraphElem data_0, GraphElem data_1, bool imm)
         {
             assert(target < size_);
-            GraphElem data_0 = data[0];
-            GraphElem data_1 = data[1];
-            current = upcxx::when_all(current,
-                    upcxx::rpc(target, [data_0, data_1](upcxx::dist_object<MaxEdgeMatchUPXRPC*>& dobj) {
+            auto body = [data_0, data_1](upcxx::dist_object<MaxEdgeMatchUPXRPC*>& dobj) {
                         MaxEdgeMatchUPXRPC *here = *dobj;
 
                         here->deactivate_edge(data_0, data_1);
@@ -301,19 +443,20 @@ class MaxEdgeMatchUPXRPC
                         if (here->mate_[here->g_->global_to_local(data_0)] == data_1) {
                             here->find_mate(data_0);
                         }
-                        }, dobj));
+                        };
+            INJECT_RPC(imm, target, body);
+        }
+
+        void Push_REJECT(int target, GraphElem data[2])
+        {
+            TRY_RPC(target, REJECT, data);
         }
        
         // request
-        void Push_REQUEST(int target, GraphElem data[2])
+        void do_REQUEST(int target, GraphElem data_0, GraphElem data_1, bool imm)
         {
             assert(target < size_);
-            GraphElem data_0 = data[0];
-            GraphElem data_1 = data[1];
-
-            current = upcxx::when_all(current,
-                    upcxx::rpc(target,
-                        [data_0, data_1](upcxx::dist_object<MaxEdgeMatchUPXRPC*>& dobj) {
+            auto body = [data_0, data_1](upcxx::dist_object<MaxEdgeMatchUPXRPC*>& dobj) {
                         bool matched = false;
                         MaxEdgeMatchUPXRPC *here = *dobj;
 
@@ -342,19 +485,28 @@ class MaxEdgeMatchUPXRPC
                             const int source = here->g_->get_owner(sdata[0]);
                             here->Push_REJECT(source, sdata);
                         }
-                    }, dobj));
+                    };
+            INJECT_RPC(imm, target, body);
+        }
+
+        void Push_REQUEST(int target, GraphElem data[2])
+        {
+            TRY_RPC(target, REQUEST, data);
         }
 
         // invalid
-        void Push_INVALID(int target, GraphElem data[2])
+        void do_INVALID(int target, GraphElem data_0, GraphElem data_1, bool imm = true)
         {
-            GraphElem data_0 = data[0];
-            GraphElem data_1 = data[1];
-            current = upcxx::when_all(current, upcxx::rpc(target,
-                    [data_0, data_1](upcxx::dist_object<MaxEdgeMatchUPXRPC*>& dobj) {
+            auto body = [data_0, data_1](upcxx::dist_object<MaxEdgeMatchUPXRPC*>& dobj) {
                         MaxEdgeMatchUPXRPC *here = *dobj;
                         here->deactivate_edge(data_0, data_1);
-                    }, dobj));
+                    };
+            INJECT_RPC(imm, target, body);
+        }
+
+        void Push_INVALID(int target, GraphElem data[2])
+        {
+            TRY_RPC(target, INVALID, data);
         }
 
         // maximal edge matching using MPI RMA
@@ -576,6 +728,9 @@ class MaxEdgeMatchUPXRPC
         // be move assigned
         upcxx::future<> current;
         upcxx::future<> prev;
+
+        // deferred RPCs
+        std::queue<rpc_closure> rpc_queue_;
 
         // count of ghost vertices not owned by me
         GraphElem *ghost_count_; 
